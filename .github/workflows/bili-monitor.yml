@@ -1,0 +1,235 @@
+name: bili-monitor-v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      keywords:
+        description: '搜索关键词（多个用逗号分隔）'
+        default: '詹姆斯中国行'
+        required: false
+  schedule:
+    - cron: '0 */6 * * *'
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          npm init -y
+          npm install playwright@1.46.0
+          npx playwright install --with-deps chromium
+
+      - name: Run enhanced monitoring
+        env:
+          KEYWORDS: ${{ github.event.inputs.keywords || '詹姆斯中国行' }}
+        run: |
+          cat > monitor-v2.js << 'SCRIPT'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+
+          async function monitorKeyword(keyword) {
+            console.log(`\n========== 监测: ${keyword} ==========`);
+            
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-dev-shm-usage']
+            });
+
+            try {
+              const context = await browser.newContext({
+                locale: 'zh-CN',
+                timezoneId: 'Asia/Shanghai',
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport: { width: 1920, height: 1080 }
+              });
+
+              const page = await context.newPage();
+              
+              // 方案1：直接访问搜索结果URL
+              const searchUrl = `https://search.bilibili.com/all?keyword=${encodeURIComponent(keyword)}`;
+              console.log('访问URL:', searchUrl);
+              
+              await page.goto(searchUrl, { 
+                waitUntil: 'networkidle',  // 等待网络空闲
+                timeout: 30000 
+              });
+
+              // 额外等待，确保动态内容加载
+              console.log('等待页面完全加载...');
+              await page.waitForTimeout(5000);
+
+              // 调试：检查页面标题
+              const title = await page.title();
+              console.log('页面标题:', title);
+
+              // 调试：检查是否有搜索结果容器
+              const hasVideoList = await page.$('div.video-list') !== null;
+              console.log('找到video-list容器:', hasVideoList);
+
+              // 截图1：初始状态
+              const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+              if (!fs.existsSync('debug')) fs.mkdirSync('debug', { recursive: true });
+              await page.screenshot({ 
+                path: `debug/${keyword}_1_initial_${timestamp}.png`, 
+                fullPage: true 
+              });
+
+              // 如果没有结果，尝试方案2：模拟搜索
+              let videos = await page.$$('div.bili-video-card');
+              
+              if (videos.length === 0) {
+                console.log('未找到视频，尝试重新搜索...');
+                
+                // 尝试点击搜索框并输入
+                const searchInput = await page.$('input.nav-search-input');
+                if (searchInput) {
+                  await searchInput.click();
+                  await searchInput.fill(keyword);
+                  await page.keyboard.press('Enter');
+                  
+                  // 等待导航
+                  await page.waitForLoadState('networkidle');
+                  await page.waitForTimeout(5000);
+                  
+                  // 再次截图
+                  await page.screenshot({ 
+                    path: `debug/${keyword}_2_after_search_${timestamp}.png`, 
+                    fullPage: true 
+                  });
+                  
+                  videos = await page.$$('div.bili-video-card');
+                }
+              }
+
+              console.log(`找到 ${videos.length} 个视频卡片`);
+
+              // 如果还是没有，检查其他可能的选择器
+              if (videos.length === 0) {
+                const alternativeSelectors = [
+                  '.video-list .bili-video-card',
+                  '.video-list-item',
+                  '[class*="video-card"]',
+                  '.search-video-list .video-item'
+                ];
+                
+                for (const selector of alternativeSelectors) {
+                  videos = await page.$$(selector);
+                  if (videos.length > 0) {
+                    console.log(`使用备用选择器 ${selector} 找到 ${videos.length} 个视频`);
+                    break;
+                  }
+                }
+              }
+
+              // 滚动加载更多
+              if (videos.length > 0) {
+                console.log('滚动加载更多...');
+                for (let i = 0; i < 3; i++) {
+                  await page.evaluate(() => window.scrollBy(0, 800));
+                  await page.waitForTimeout(2000);
+                }
+                videos = await page.$$('div.bili-video-card');
+                console.log(`滚动后找到 ${videos.length} 个视频`);
+              }
+
+              // 保存最终截图
+              if (!fs.existsSync('screenshots')) fs.mkdirSync('screenshots', { recursive: true });
+              await page.screenshot({ 
+                path: `screenshots/${keyword}_final_${timestamp}.png`, 
+                fullPage: true 
+              });
+
+              // 提取数据
+              const results = [];
+              for (const video of videos.slice(0, 30)) {
+                try {
+                  const data = await video.evaluate(el => {
+                    const getTextContent = (selector) => {
+                      const elem = el.querySelector(selector);
+                      return elem ? elem.textContent.trim() : '';
+                    };
+                    
+                    const titleEl = el.querySelector('h3.bili-video-card__info--tit, .bili-video-card__info--tit');
+                    const linkEl = el.querySelector('a');
+                    
+                    return {
+                      title: titleEl?.getAttribute('title') || getTextContent('h3'),
+                      link: linkEl?.href || '',
+                      up: getTextContent('.bili-video-card__info--author'),
+                      views: getTextContent('.bili-video-card__stats--item:nth-child(1)'),
+                      danmaku: getTextContent('.bili-video-card__stats--item:nth-child(2)')
+                    };
+                  });
+
+                  if (data.title) results.push(data);
+                } catch (e) {}
+              }
+
+              // 保存数据
+              if (!fs.existsSync('data')) fs.mkdirSync('data', { recursive: true });
+              const dataPath = `data/${keyword}_${timestamp}.json`;
+              fs.writeFileSync(dataPath, JSON.stringify({
+                keyword,
+                url: searchUrl,
+                timestamp,
+                video_count: results.length,
+                videos: results
+              }, null, 2));
+              
+              console.log(`数据已保存: ${dataPath}`);
+
+              // 如果没数据，保存HTML
+              if (results.length === 0) {
+                const html = await page.content();
+                fs.writeFileSync(`debug/${keyword}_${timestamp}.html`, html);
+                console.log('未找到数据，已保存HTML用于调试');
+              }
+
+              await browser.close();
+              return { keyword, count: results.length };
+
+            } catch (error) {
+              console.error(`错误:`, error);
+              await browser.close();
+              throw error;
+            }
+          }
+
+          // 主函数
+          (async () => {
+            const keywords = process.env.KEYWORDS.split(',').map(k => k.trim());
+            
+            for (const keyword of keywords) {
+              try {
+                await monitorKeyword(keyword);
+              } catch (e) {
+                console.error(`监测 ${keyword} 失败:`, e.message);
+              }
+              
+              // 暂停避免过快
+              if (keywords.indexOf(keyword) < keywords.length - 1) {
+                await new Promise(r => setTimeout(r, 5000));
+              }
+            }
+            
+            console.log('\n========== 全部完成 ==========');
+          })();
+          SCRIPT
+
+          node monitor-v2.js
+
+      - name: Upload all results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bili-results-${{ github.run_number }}
+          path: |
+            data/
+            screenshots/
+            debug/
